@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram File Receiver Bot — Production Final (24x7 Stable)
-- Robust polling with auto-reconnect (fresh Application on restart)
+Telegram File Receiver Bot — Production Final v3
+- Access check ONLY on Receive flow
+- /filter → owner only, sends files directly (no details)
+- /checkall → normal user sees only uploader Name; owner sees Name + Username + Telegram ID + Time
+- Uploader gets notification when their file is received by someone
 - Owner Broadcast (Receiver / Uploader)
-- Daily Upload Reminders every 3 hours (YES / NO flow)
-- YouTube upload follow-up (2 min, then every 10 min if NO)
-- Health server on 0.0.0.0:$PORT
+- Daily reminders every 3h + YouTube follow-up
+- Health server + robust polling (24x7)
 """
 
 import os
@@ -68,7 +70,6 @@ REMINDER_INTERVAL_SECONDS = 3 * 3600
 YOUTUBE_INITIAL_DELAY = 2 * 60
 YOUTUBE_REPEAT_DELAY = 10 * 60
 
-# Global references for the reminder loop (survives app restarts)
 CURRENT_BOT = None
 PENDING_YT_REMINDERS = {}
 
@@ -147,6 +148,14 @@ def format_remaining(seconds):
     if not parts:
         parts.append(f"{seconds % 60}s")
     return " ".join(parts)
+
+
+def fmt_time(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return iso_str or "-"
 
 
 YOUTUBE_INSTRUCTION_HTML = (
@@ -679,7 +688,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/start - Welcome menu",
             "/help - Show this help",
             "/upload - Upload Thumbnail / Video (open to all)",
-            "/receive - Receive Thumbnail / Video (authorized only)",
+            "/receive - Receive Thumbnail / Video (authorized users only)",
             "/checkyourupload - Your uploaded files",
             "/checkall - All uploads with receive count",
         ]
@@ -689,7 +698,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "👑 Owner commands:",
                 "/add USERID - Authorize a user",
                 "/remove USERID - Remove a user",
-                "/filter - Send all uploaded documents to owner",
+                "/filter - Send all uploaded files to owner",
                 "/delete_post UPLOAD_ID - Delete an upload",
                 "/ownerbroadcast - Broadcast a message (receiver / uploader)",
             ]
@@ -767,6 +776,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Upload is open to everyone — no access check."""
     try:
         user = update.effective_user
         if update.message is None or user is None:
@@ -782,6 +792,7 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive requires authorization."""
     try:
         user = update.effective_user
         if update.message is None or user is None:
@@ -798,6 +809,7 @@ async def cmd_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner only — sends each uploaded file directly (no details)."""
     try:
         user = update.effective_user
         if update.message is None or user is None:
@@ -812,21 +824,15 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            f"📤 Sending {len(uploads)} upload(s) to you..."
+            f"📤 Sending {len(uploads)} file(s) to you..."
         )
 
         for u in uploads:
-            caption = (
-                f"Upload ID: {u['upload_id']}\n"
-                f"Type: {u['upload_type']}\n"
-                f"Uploader Name: {u['uploader_name'] or 'Unknown'}\n"
-                f"Uploader ID: {u['uploader_id']}"
-            )
             try:
                 await context.bot.send_document(
                     chat_id=OWNER_ID,
                     document=u["telegram_file_id"],
-                    caption=caption,
+                    filename=u.get("filename") or None,
                 )
             except Forbidden:
                 logger.warning("Forbidden sending filter file to owner")
@@ -841,7 +847,7 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Telegram error sending filter file: {e}")
             except Exception as e:
                 logger.error(f"Unexpected error sending filter file: {e}")
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.15)
     except Exception as e:
         logger.error(f"/filter error: {e}", exc_info=e)
         try:
@@ -878,12 +884,10 @@ async def cmd_delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_checkyourupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """No access check — anyone can see their own uploads."""
     try:
         user = update.effective_user
         if update.message is None or user is None:
-            return
-        if not db.is_authorized(user.id):
-            await update.message.reply_text(unauth_msg(user.id))
             return
         uploads = db.get_uploads_by_uploader(user.id)
         if not uploads:
@@ -895,6 +899,7 @@ async def cmd_checkyourupload(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append(
                 f"• {u['filename']}\n"
                 f"  Type: {u['upload_type']} | Received: {count}\n"
+                f"  Time: {fmt_time(u.get('created_at'))}\n"
                 f"  ID: {u['upload_id']}"
             )
         for chunk in split_message("\n".join(lines)):
@@ -904,26 +909,46 @@ async def cmd_checkyourupload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    No access check.
+    - Normal user → only uploader Name (no username, no telegram ID)
+    - Owner → Name + Username + Telegram ID + Time
+    """
     try:
         user = update.effective_user
         if update.message is None or user is None:
             return
-        if not db.is_authorized(user.id):
-            await update.message.reply_text(unauth_msg(user.id))
-            return
+
         uploads = db.get_all_uploads()
         if not uploads:
             await update.message.reply_text("📭 No uploads.")
             return
 
+        is_owner = user.id == OWNER_ID
         lines = ["📊 All Uploads:", ""]
+
         for u in uploads:
             count = db.get_upload_receive_count(u["upload_id"])
-            lines.append(
-                f"• {u['filename']}\n"
-                f"  Type: {u['upload_type']} | Received: {count}\n"
-                f"  ID: {u['upload_id']}"
-            )
+            name = u.get("uploader_name") or "Unknown"
+            if is_owner:
+                uname = u.get("uploader_username") or "-"
+                uid = u.get("uploader_id") or "-"
+                lines.append(
+                    f"• {u['filename']}\n"
+                    f"  Type: {u['upload_type']} | Received: {count}\n"
+                    f"  Uploader: {name} (@{uname}, {uid})\n"
+                    f"  Time: {fmt_time(u.get('created_at'))}\n"
+                    f"  ID: {u['upload_id']}"
+                )
+            else:
+                lines.append(
+                    f"• {u['filename']}\n"
+                    f"  Type: {u['upload_type']} | Received: {count}\n"
+                    f"  Uploader: {name}\n"
+                    f"  Time: {fmt_time(u.get('created_at'))}\n"
+                    f"  ID: {u['upload_id']}"
+                )
+
         for chunk in split_message("\n".join(lines)):
             await update.message.reply_text(chunk)
     except Exception as e:
@@ -975,6 +1000,35 @@ def _type_to_db(t: str) -> str:
     return "Thumbnail" if t == "thumbnail" else "Video"
 
 
+async def _notify_uploader(context, upload, receiver):
+    """Notify uploader that their file was received by someone."""
+    try:
+        uploader_id = upload.get("uploader_id")
+        if not uploader_id:
+            return
+        if uploader_id == receiver.id:
+            return  # receiver is uploader - no need
+        recv_name = receiver.full_name or "Unknown"
+        recv_uname = receiver.username or "-"
+        text = (
+            "🔔 Your uploaded file was received!\n\n"
+            f"📎 File: {upload.get('filename') or 'file'}\n"
+            f"📁 Type: {upload.get('upload_type')}\n"
+            f"👤 Received by: {recv_name} (@{recv_uname})\n"
+            f"🆔 Receiver ID: {receiver.id}"
+        )
+        try:
+            await context.bot.send_message(uploader_id, text)
+        except Forbidden:
+            logger.warning(f"Forbidden notifying uploader {uploader_id}")
+        except (BadRequest, TimedOut, NetworkError) as e:
+            logger.warning(f"Network/BadRequest notifying uploader {uploader_id}: {e}")
+        except TelegramError as e:
+            logger.warning(f"Telegram error notifying uploader {uploader_id}: {e}")
+    except Exception as e:
+        logger.warning(f"notify_uploader failed: {e}")
+
+
 async def _schedule_yt_followup(bot, user_id, delay):
     try:
         await asyncio.sleep(delay)
@@ -1000,6 +1054,7 @@ async def _schedule_yt_followup(bot, user_id, delay):
 async def _do_receive(chat_id, user, upload_type_key, context):
     upload_type = _type_to_db(upload_type_key)
 
+    # Access check ONLY here
     if not db.is_authorized(user.id):
         try:
             await context.bot.send_message(chat_id, unauth_msg(user.id))
@@ -1072,6 +1127,10 @@ async def _do_receive(chat_id, user, upload_type_key, context):
             db.set_last_received_at(user.id, upload_type)
         db.release_stale_reservations()
 
+        # Notify uploader
+        await _notify_uploader(context, upload, user)
+
+        # YouTube instruction for video
         if upload_type == "Video":
             try:
                 await context.bot.send_message(
@@ -1128,6 +1187,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
 
     try:
+        # Receive menu — access check
         if data == "menu_receive":
             if not db.is_authorized(user.id):
                 try:
@@ -1153,6 +1213,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
             return
 
+        # Upload menu — NO access check
         if data == "menu_upload":
             context.user_data.pop("pending_upload_type", None)
             try:
@@ -1177,6 +1238,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _do_receive(query.message.chat_id, user, key, context)
             return
 
+        # Upload type — NO access check
         if data.startswith("upl:"):
             key = data.split(":", 1)[1]
             if key not in ("thumbnail", "video"):
@@ -1296,6 +1358,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MESSAGE HANDLERS
 # ---------------------------------------------------------------------------
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Accept DOCUMENT uploads from anyone — no access check."""
     try:
         if update.message is None or update.effective_user is None:
             return
@@ -1417,7 +1480,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def reminder_loop():
     global CURRENT_BOT
-    await asyncio.sleep(90)  # wait for startup
+    await asyncio.sleep(90)
     while True:
         try:
             bot = CURRENT_BOT
@@ -1536,17 +1599,11 @@ def build_app() -> Application:
 
 
 # ---------------------------------------------------------------------------
-# MAIN — 24x7 robust polling loop
+# MAIN
 # ---------------------------------------------------------------------------
 async def run_bot_forever():
-    """
-    Rebuilds the Application on fatal errors so the bot never stays dead.
-    Health server runs in background. Reminder loop runs once, referencing
-    CURRENT_BOT which is updated on each restart.
-    """
     global CURRENT_BOT
 
-    # Start reminder loop once
     asyncio.create_task(reminder_loop())
 
     backoff = 3
@@ -1569,8 +1626,6 @@ async def run_bot_forever():
                 timeout=30,
             )
 
-            # If start_polling returns, polling has stopped. Wait for it or exit.
-            # Keep this coroutine alive by waiting on updater.running
             while app.updater.running:
                 await asyncio.sleep(5)
 
@@ -1607,12 +1662,10 @@ async def run_bot_forever():
 
         logger.info(f"Restarting in {backoff}s...")
         await asyncio.sleep(backoff)
-        # small bounded backoff to avoid tight restart loops
         backoff = min(backoff + 3, 30)
 
 
 def main():
-    # Health server thread
     health_thread = Thread(target=run_health_server, daemon=True)
     health_thread.start()
     logger.info(f"Health server thread started (PID: {os.getpid()})")
