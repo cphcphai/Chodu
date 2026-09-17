@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: telegram-file-receiver-bot
+    runtime: python311
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PORT
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DB_PATH
+        value: /var/data/bot.db
+        sync: false
+    healthCheckPath: /
+    healthCheckInterval: 30
