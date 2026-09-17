@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram File Receiver Bot — Production Patched
-Buttons, Authorization, Cooldown, Duplicate Protection, Reservation Recovery
-SQLite persistence, HTTP health server + polling in one process
+Telegram File Receiver Bot — Production Final (24x7 Stable)
+- Robust polling with auto-reconnect (fresh Application on restart)
+- Owner Broadcast (Receiver / Uploader)
+- Daily Upload Reminders every 3 hours (YES / NO flow)
+- YouTube upload follow-up (2 min, then every 10 min if NO)
+- Health server on 0.0.0.0:$PORT
 """
 
 import os
@@ -11,6 +14,7 @@ import sqlite3
 import uuid
 import asyncio
 import logging
+import gc
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from threading import Thread
@@ -35,6 +39,7 @@ from telegram.error import (
     BadRequest,
     TimedOut,
     NetworkError,
+    Conflict,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,6 +63,14 @@ logger = logging.getLogger("gvm-bot")
 CONTACT_HANDLE = "@GVM_TRUST"
 COOLDOWN_HOURS = 3
 STALE_RESERVATION_MINUTES = 30
+
+REMINDER_INTERVAL_SECONDS = 3 * 3600
+YOUTUBE_INITIAL_DELAY = 2 * 60
+YOUTUBE_REPEAT_DELAY = 10 * 60
+
+# Global references for the reminder loop (survives app restarts)
+CURRENT_BOT = None
+PENDING_YT_REMINDERS = {}
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +149,20 @@ def format_remaining(seconds):
     return " ".join(parts)
 
 
+YOUTUBE_INSTRUCTION_HTML = (
+    "🎬 <b>Video Received!</b>\n\n"
+    "Ab ye follow karo:\n\n"
+    "1️⃣ YouTube par video upload karo\n"
+    "2️⃣ Thumbnail le lena\n"
+    "3️⃣ Acha title + description likho\n"
+    "4️⃣ Tag section me tags daalo taki video viral ho\n"
+    "5️⃣ YouTube ke comment section me ye paste karo (tap to copy):\n\n"
+    "<code>𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿 𝙇𝙄𝙉𝙆 - https://t.me/+3ng9H1jBE9JhMzI1\n"
+    "𝙊𝙒𝙉𝙀𝙍 - https://t.me/GVM_TRUST</code>\n\n"
+    "⏳ 2 minute baad bot aapse puchhega ki YouTube par upload hua ya nahi."
+)
+
+
 # ---------------------------------------------------------------------------
 # DATABASE
 # ---------------------------------------------------------------------------
@@ -152,11 +179,17 @@ class Database:
             yield conn
             conn.commit()
         except sqlite3.OperationalError as e:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             logger.error(f"DB Lock: {e}")
             raise
         except Exception:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             raise
         finally:
             conn.close()
@@ -231,7 +264,6 @@ class Database:
             )
             logger.info("Database initialized")
 
-        # Release stale reservations at startup (do not delete DB)
         try:
             self.release_stale_reservations()
         except Exception as e:
@@ -315,6 +347,31 @@ class Database:
         except Exception as e:
             logger.error(f"is_authorized error: {e}")
             return False
+
+    def get_all_authorized_receivers(self):
+        try:
+            with self.get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT user_id FROM users WHERE authorized = 1"
+                ).fetchall()
+                ids = [r["user_id"] for r in rows]
+                if OWNER_ID not in ids:
+                    ids.append(OWNER_ID)
+                return ids
+        except Exception as e:
+            logger.error(f"get_all_authorized_receivers error: {e}")
+            return [OWNER_ID]
+
+    def get_all_uploaders(self):
+        try:
+            with self.get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT uploader_id FROM uploads"
+                ).fetchall()
+                return [r["uploader_id"] for r in rows if r["uploader_id"]]
+        except Exception as e:
+            logger.error(f"get_all_uploaders error: {e}")
+            return []
 
     # -------- uploads --------
     def store_upload(
@@ -417,12 +474,21 @@ class Database:
             logger.error(f"delete_upload error: {e}")
             return False
 
+    def has_uploaded_today(self, user_id):
+        try:
+            today = datetime.utcnow().date().isoformat()
+            with self.get_connection() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM uploads WHERE uploader_id = ? AND created_at LIKE ?",
+                    (user_id, f"{today}%"),
+                ).fetchone()
+                return int(row["c"]) > 0 if row else False
+        except Exception as e:
+            logger.error(f"has_uploaded_today error: {e}")
+            return False
+
     # -------- deliveries --------
     def reserve_upload(self, upload_id, receiver_id):
-        """
-        Returns (ok: bool, reason: str)
-        reason: 'ok' | 'already' | 'error'
-        """
         try:
             with self.get_connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -434,7 +500,6 @@ class Database:
                 if row:
                     if row["status"] == "sent":
                         return (False, "already")
-                    # already reserved - refresh timestamp, treat as ok
                     conn.execute(
                         "UPDATE deliveries SET reserved_at = ? WHERE upload_id = ? AND receiver_id = ?",
                         (now, upload_id, receiver_id),
@@ -593,7 +658,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if user is None or update.message is None:
             return
-        # Never reset authorization — just record/update profile
         db.upsert_user(user.id, user.username or "", user.full_name or "")
         await update.message.reply_text(
             "👋 Welcome!\nUse /help to check all command and help.",
@@ -614,8 +678,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "",
             "/start - Welcome menu",
             "/help - Show this help",
-            "/upload - Upload a Thumbnail / Video document",
-            "/receive - Receive a Thumbnail / Video document",
+            "/upload - Upload Thumbnail / Video (open to all)",
+            "/receive - Receive Thumbnail / Video (authorized only)",
             "/checkyourupload - Your uploaded files",
             "/checkall - All uploads with receive count",
         ]
@@ -627,6 +691,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/remove USERID - Remove a user",
                 "/filter - Send all uploaded documents to owner",
                 "/delete_post UPLOAD_ID - Delete an upload",
+                "/ownerbroadcast - Broadcast a message (receiver / uploader)",
             ]
         lines += [
             "",
@@ -650,7 +715,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Usage: /add USERID")
             return
         raw = context.args[0].strip()
-        if not raw.lstrip("-").isdigit() or not raw.isdigit():
+        if not raw.isdigit():
             await update.message.reply_text(
                 "❌ Invalid Telegram ID. It must be numeric."
             )
@@ -706,9 +771,7 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if update.message is None or user is None:
             return
-        if not db.is_authorized(user.id):
-            await update.message.reply_text(unauth_msg(user.id))
-            return
+        db.upsert_user(user.id, user.username or "", user.full_name or "")
         context.user_data.pop("pending_upload_type", None)
         await update.message.reply_text(
             "📤 Upload\n\nChoose the upload type:",
@@ -778,6 +841,7 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Telegram error sending filter file: {e}")
             except Exception as e:
                 logger.error(f"Unexpected error sending filter file: {e}")
+            await asyncio.sleep(0.1)
     except Exception as e:
         logger.error(f"/filter error: {e}", exc_info=e)
         try:
@@ -866,6 +930,44 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"/checkall error: {e}", exc_info=e)
 
 
+async def cmd_ownerbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if user.id != OWNER_ID:
+            await update.message.reply_text("❌ Owner only command.")
+            return
+        context.user_data["awaiting_broadcast"] = True
+        context.user_data.pop("broadcast_text", None)
+        await update.message.reply_text(
+            "📢 Send the broadcast message now.\n"
+            "I will then show you two buttons:\n"
+            "• 📥 Send to Receivers\n"
+            "• 📤 Send to Uploaders"
+        )
+    except Exception as e:
+        logger.error(f"/ownerbroadcast error: {e}", exc_info=e)
+
+
+async def _broadcast_to(chat_ids, text, context):
+    sent = 0
+    for uid in chat_ids:
+        try:
+            await context.bot.send_message(uid, text)
+            sent += 1
+        except Forbidden:
+            logger.warning(f"Broadcast forbidden for {uid}")
+        except (BadRequest, TimedOut, NetworkError) as e:
+            logger.warning(f"Broadcast error for {uid}: {e}")
+        except TelegramError as e:
+            logger.warning(f"Broadcast telegram error for {uid}: {e}")
+        except Exception as e:
+            logger.warning(f"Broadcast unexpected error for {uid}: {e}")
+        await asyncio.sleep(0.05)
+    return sent
+
+
 # ---------------------------------------------------------------------------
 # RECEIVE FLOW
 # ---------------------------------------------------------------------------
@@ -873,8 +975,29 @@ def _type_to_db(t: str) -> str:
     return "Thumbnail" if t == "thumbnail" else "Video"
 
 
+async def _schedule_yt_followup(bot, user_id, delay):
+    try:
+        await asyncio.sleep(delay)
+        if not PENDING_YT_REMINDERS.get(user_id):
+            return
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ YES", callback_data="yt:yes"),
+                    InlineKeyboardButton("❌ NO", callback_data="yt:no"),
+                ]
+            ]
+        )
+        await bot.send_message(
+            user_id,
+            "🎬 YouTube me video upload ki kya?\n\nYES / NO dabao.",
+            reply_markup=kb,
+        )
+    except Exception as e:
+        logger.warning(f"yt follow-up send failed for {user_id}: {e}")
+
+
 async def _do_receive(chat_id, user, upload_type_key, context):
-    """Handle actual file delivery to user for a given type."""
     upload_type = _type_to_db(upload_type_key)
 
     if not db.is_authorized(user.id):
@@ -884,7 +1007,6 @@ async def _do_receive(chat_id, user, upload_type_key, context):
             pass
         return
 
-    # Cooldown check
     if user.id != OWNER_ID:
         remaining = db.get_cooldown_remaining(user.id, upload_type)
         if remaining > 0:
@@ -949,6 +1071,22 @@ async def _do_receive(chat_id, user, upload_type_key, context):
         if user.id != OWNER_ID:
             db.set_last_received_at(user.id, upload_type)
         db.release_stale_reservations()
+
+        if upload_type == "Video":
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    YOUTUBE_INSTRUCTION_HTML,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning(f"YT instruction send failed: {e}")
+
+            PENDING_YT_REMINDERS[user.id] = True
+            asyncio.create_task(
+                _schedule_yt_followup(context.bot, user.id, YOUTUBE_INITIAL_DELAY)
+            )
     except Forbidden:
         db.release_reservation(upload["upload_id"], user.id)
         logger.warning(f"Forbidden sending to user {user.id}")
@@ -975,7 +1113,7 @@ async def _do_receive(chat_id, user, upload_type_key, context):
 
 
 # ---------------------------------------------------------------------------
-# CALLBACK QUERY HANDLER
+# CALLBACK HANDLER
 # ---------------------------------------------------------------------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1016,15 +1154,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "menu_upload":
-            if not db.is_authorized(user.id):
-                try:
-                    await query.edit_message_text(unauth_msg(user.id))
-                except Exception:
-                    try:
-                        await query.message.reply_text(unauth_msg(user.id))
-                    except Exception:
-                        pass
-                return
             context.user_data.pop("pending_upload_type", None)
             try:
                 await query.edit_message_text(
@@ -1052,12 +1181,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             key = data.split(":", 1)[1]
             if key not in ("thumbnail", "video"):
                 return
-            if not db.is_authorized(user.id):
-                try:
-                    await query.edit_message_text(unauth_msg(user.id))
-                except Exception:
-                    pass
-                return
             context.user_data["pending_upload_type"] = key
             label = "Thumbnail" if key == "thumbnail" else "Video"
             try:
@@ -1073,23 +1196,111 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
             return
 
+        if data == "bc:receiver":
+            if user.id != OWNER_ID:
+                return
+            text = context.user_data.get("broadcast_text", "")
+            ids = db.get_all_authorized_receivers()
+            try:
+                await query.edit_message_text("📤 Sending to receivers...")
+            except Exception:
+                pass
+            sent = await _broadcast_to(ids, text, context)
+            try:
+                await query.edit_message_text(
+                    f"✅ Broadcast sent to {sent} receiver(s)."
+                )
+            except Exception:
+                pass
+            return
+
+        if data == "bc:uploader":
+            if user.id != OWNER_ID:
+                return
+            text = context.user_data.get("broadcast_text", "")
+            ids = db.get_all_uploaders()
+            try:
+                await query.edit_message_text("📤 Sending to uploaders...")
+            except Exception:
+                pass
+            sent = await _broadcast_to(ids, text, context)
+            try:
+                await query.edit_message_text(
+                    f"✅ Broadcast sent to {sent} uploader(s)."
+                )
+            except Exception:
+                pass
+            return
+
+        if data == "rem:yes":
+            if db.has_uploaded_today(user.id):
+                try:
+                    await query.edit_message_text(
+                        "✅ Theek hai, ho gaya!\n\n"
+                        "Aaj ka upload complete. Aage koi reminder nahi aayega aaj."
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    await query.edit_message_text(
+                        "❌ Nahi, aapne aaj upload nahi kiya.\n\n"
+                        "Jaldi /upload se apna Thumbnail ya Video upload karo.\n"
+                        "Tab tak reminder aate rahenge."
+                    )
+                except Exception:
+                    pass
+            return
+
+        if data == "rem:no":
+            try:
+                await query.edit_message_text(
+                    "📤 Jao /upload karo bot me aur aaj ka Thumbnail ya Video upload karo.\n\n"
+                    "Jaldi karo, reminder aate rahenge jab tak upload nahi hota."
+                )
+            except Exception:
+                pass
+            return
+
+        if data == "yt:yes":
+            PENDING_YT_REMINDERS[user.id] = False
+            try:
+                await query.edit_message_text(
+                    "✅ Shabash! YouTube upload complete.\n\n"
+                    "Aage bhi isi tarah karte raho 💪"
+                )
+            except Exception:
+                pass
+            return
+
+        if data == "yt:no":
+            if not PENDING_YT_REMINDERS.get(user.id):
+                PENDING_YT_REMINDERS[user.id] = True
+            try:
+                await query.edit_message_text(
+                    "⚠️ Jaldi YouTube par video upload karo!\n\n"
+                    "Har 10 minute me bot aapko yaad dilata rahega."
+                )
+            except Exception:
+                pass
+            asyncio.create_task(
+                _schedule_yt_followup(context.bot, user.id, YOUTUBE_REPEAT_DELAY)
+            )
+            return
+
     except Exception as e:
         logger.error(f"on_callback error: {e}", exc_info=e)
 
 
 # ---------------------------------------------------------------------------
-# DOCUMENT / MEDIA HANDLERS
+# MESSAGE HANDLERS
 # ---------------------------------------------------------------------------
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Accept ONLY Telegram DOCUMENT uploads."""
     try:
         if update.message is None or update.effective_user is None:
             return
         user = update.effective_user
-
-        if not db.is_authorized(user.id):
-            await update.message.reply_text(unauth_msg(user.id))
-            return
+        db.upsert_user(user.id, user.username or "", user.full_name or "")
 
         doc = update.message.document
         if doc is None:
@@ -1098,7 +1309,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = doc.file_name or "file"
         mime_type = doc.mime_type or "application/octet-stream"
 
-        # Determine upload type: pending selection first, else derive from mime
         pending = context.user_data.get("pending_upload_type")
         if pending == "thumbnail":
             upload_type = "Thumbnail"
@@ -1153,15 +1363,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reject normal photo/video messages."""
     try:
         if update.message is None:
-            return
-        user = update.effective_user
-        if user is None:
-            return
-        if not db.is_authorized(user.id):
-            await update.message.reply_text(unauth_msg(user.id))
             return
         await update.message.reply_text(
             "❌ Only Telegram DOCUMENT/FILE uploads are accepted.\n"
@@ -1169,6 +1372,96 @@ async def handle_photo_video(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except Exception as e:
         logger.error(f"handle_photo_video error: {e}", exc_info=e)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update.message is None or update.effective_user is None:
+            return
+        user = update.effective_user
+
+        if user.id == OWNER_ID and context.user_data.get("awaiting_broadcast"):
+            context.user_data["awaiting_broadcast"] = False
+            text = update.message.text or ""
+            context.user_data["broadcast_text"] = text
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "📥 Send to Receivers", callback_data="bc:receiver"
+                        ),
+                        InlineKeyboardButton(
+                            "📤 Send to Uploaders", callback_data="bc:uploader"
+                        ),
+                    ]
+                ]
+            )
+            await update.message.reply_text(
+                f"📢 Broadcast preview:\n\n{text}\n\nChoose audience:",
+                reply_markup=kb,
+            )
+            return
+    except Exception as e:
+        logger.error(f"handle_text error: {e}", exc_info=e)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        logger.error("Exception while handling an update:", exc_info=context.error)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# REMINDER LOOP
+# ---------------------------------------------------------------------------
+async def reminder_loop():
+    global CURRENT_BOT
+    await asyncio.sleep(90)  # wait for startup
+    while True:
+        try:
+            bot = CURRENT_BOT
+            if bot is not None:
+                uploaders = db.get_all_uploaders()
+                for uid in uploaders:
+                    if uid == OWNER_ID:
+                        continue
+                    if db.has_uploaded_today(uid):
+                        continue
+                    try:
+                        kb = InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton(
+                                        "✅ YES", callback_data="rem:yes"
+                                    ),
+                                    InlineKeyboardButton(
+                                        "❌ NO", callback_data="rem:no"
+                                    ),
+                                ]
+                            ]
+                        )
+                        await bot.send_message(
+                            uid,
+                            "🔔 OWNER KI DEAL KE ANUSAR\n\n"
+                            "Aaj ka apne Thumbnail ya Video jo aapko bola tha,\n"
+                            "kya upload kar diya?\n\n"
+                            "YES / NO dabao.",
+                            reply_markup=kb,
+                        )
+                    except Forbidden:
+                        logger.warning(f"Reminder forbidden for {uid}")
+                    except (BadRequest, TimedOut, NetworkError) as e:
+                        logger.warning(f"Reminder error for {uid}: {e}")
+                    except TelegramError as e:
+                        logger.warning(f"Reminder telegram error for {uid}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Reminder unexpected error for {uid}: {e}")
+                    await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"reminder_loop error: {e}", exc_info=e)
+
+        await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -1199,26 +1492,23 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def run_health_server():
-    try:
-        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-        logger.info(f"Health server listening on 0.0.0.0:{PORT}")
-        server.serve_forever()
-    except Exception as e:
-        logger.error(f"Health server error: {e}", exc_info=e)
+    while True:
+        try:
+            server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+            logger.info(f"Health server listening on 0.0.0.0:{PORT}")
+            server.serve_forever()
+        except Exception as e:
+            logger.error(f"Health server error: {e}", exc_info=e)
+            import time as _t
+            _t.sleep(5)
 
 
 # ---------------------------------------------------------------------------
-# MAIN
+# APP BUILDER
 # ---------------------------------------------------------------------------
-async def main():
-    # Health server in background thread
-    health_thread = Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-    logger.info(f"Health server thread started (PID: {os.getpid()})")
-
+def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
@@ -1229,48 +1519,115 @@ async def main():
     app.add_handler(CommandHandler("delete_post", cmd_delete_post))
     app.add_handler(CommandHandler("checkyourupload", cmd_checkyourupload))
     app.add_handler(CommandHandler("checkall", cmd_checkall))
+    app.add_handler(CommandHandler("ownerbroadcast", cmd_ownerbroadcast))
 
-    # Callback handler
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Document handler
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    # Reject photo/video
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.VIDEO, handle_photo_video)
     )
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
 
-    logger.info("Bot polling starting...")
-    await app.initialize()
-    await app.start()
+    app.add_error_handler(on_error)
+    return app
 
-    backoff = 1
+
+# ---------------------------------------------------------------------------
+# MAIN — 24x7 robust polling loop
+# ---------------------------------------------------------------------------
+async def run_bot_forever():
+    """
+    Rebuilds the Application on fatal errors so the bot never stays dead.
+    Health server runs in background. Reminder loop runs once, referencing
+    CURRENT_BOT which is updated on each restart.
+    """
+    global CURRENT_BOT
+
+    # Start reminder loop once
+    asyncio.create_task(reminder_loop())
+
+    backoff = 3
     while True:
+        app = None
         try:
-            logger.info(f"Starting polling (backoff={backoff}s)")
+            logger.info("Building Telegram application...")
+            app = build_app()
+
+            await app.initialize()
+            await app.start()
+
+            CURRENT_BOT = app.bot
+
+            logger.info("Starting polling...")
             await app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=False,
+                poll_interval=1.0,
+                timeout=30,
             )
-            backoff = 1
-            logger.warning("Polling stopped, restarting...")
-            await asyncio.sleep(2)
+
+            # If start_polling returns, polling has stopped. Wait for it or exit.
+            # Keep this coroutine alive by waiting on updater.running
+            while app.updater.running:
+                await asyncio.sleep(5)
+
+            logger.warning("Polling stopped gracefully.")
+        except Conflict as e:
+            logger.error(
+                f"Conflict: {e}. Another instance might be running. Waiting..."
+            )
         except TelegramError as e:
-            logger.error(f"Telegram error in polling: {e}")
-            await asyncio.sleep(min(backoff, 60))
-            backoff = min(backoff * 2, 60)
+            logger.error(f"Telegram error in main loop: {e}", exc_info=True)
         except Exception as e:
-            logger.error(f"Unexpected error in polling: {e}", exc_info=e)
-            await asyncio.sleep(min(backoff, 60))
-            backoff = min(backoff * 2, 60)
+            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+        finally:
+            CURRENT_BOT = None
+            if app is not None:
+                try:
+                    if app.updater and app.updater.running:
+                        await app.updater.stop()
+                except Exception as e:
+                    logger.warning(f"updater.stop() error: {e}")
+                try:
+                    await app.stop()
+                except Exception as e:
+                    logger.warning(f"app.stop() error: {e}")
+                try:
+                    await app.shutdown()
+                except Exception as e:
+                    logger.warning(f"app.shutdown() error: {e}")
+
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+        logger.info(f"Restarting in {backoff}s...")
+        await asyncio.sleep(backoff)
+        # small bounded backoff to avoid tight restart loops
+        backoff = min(backoff + 3, 30)
+
+
+def main():
+    # Health server thread
+    health_thread = Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    logger.info(f"Health server thread started (PID: {os.getpid()})")
+
+    while True:
+        try:
+            asyncio.run(run_bot_forever())
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Fatal error, restarting event loop: {e}", exc_info=True)
+            import time as _t
+            _t.sleep(5)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot shutting down...")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=e)
-        sys.exit(1)
+    main()
